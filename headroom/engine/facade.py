@@ -275,12 +275,29 @@ class HeadroomEngine:
 
     # ── Request hook ──────────────────────────────────────────────────────────
 
-    def on_request(self, ctx: RequestContext) -> RequestDecision:
+    def on_request(
+        self,
+        ctx: RequestContext,
+        *,
+        _session_tracker_store_override: Any | None = None,
+    ) -> RequestDecision:
         """Process an inbound request.
 
         For registered ``(provider, flavor)`` combos: classify auth mode,
         decide whether to compress, and either return the raw body unchanged
         (passthrough) or run the pipeline and return the mutated body.
+
+        Parameters
+        ----------
+        ctx:
+            The request context (provider, flavor, raw_body, headers, …).
+        _session_tracker_store_override:
+            Internal. When set, the Anthropic real path uses this store
+            instead of ``self._anthropic_components.session_tracker_store``.
+            Intended for the Chunk 4.3-ii shadow hook: the handler seeds a
+            controlled store from its own frozen-count snapshot so the engine
+            and the live path see identical prefix-tracker state for this
+            one call. The engine's private store is NOT modified.
 
         Raises
         ------
@@ -296,7 +313,9 @@ class HeadroomEngine:
             and ctx.flavor == Flavor.MESSAGES
             and self._anthropic_components is not None
         ):
-            return self._on_request_anthropic_real(ctx)
+            return self._on_request_anthropic_real(
+                ctx, _session_tracker_store_override=_session_tracker_store_override
+            )
 
         # Legacy fake-pipeline path (Chunks 1-2)
         key = (ctx.provider, ctx.flavor)
@@ -310,7 +329,12 @@ class HeadroomEngine:
 
     # ── Real Anthropic orchestration (Chunk 4.2a + 4.2b) ─────────────────────
 
-    def _on_request_anthropic_real(self, ctx: RequestContext) -> RequestDecision:
+    def _on_request_anthropic_real(
+        self,
+        ctx: RequestContext,
+        *,
+        _session_tracker_store_override: Any | None = None,
+    ) -> RequestDecision:
         """Reproduce the handler's compression-core + CCR request-side path.
 
         Mirrors ``AnthropicHandlerMixin.handle_messages`` through:
@@ -330,6 +354,13 @@ class HeadroomEngine:
 
         Excluded from this chunk: hooks, pipeline_extension events, security
         scan, traffic_learner.
+
+        Parameters
+        ----------
+        _session_tracker_store_override:
+            When set, use this store for session-tracker lookup INSTEAD of
+            ``ac.session_tracker_store``. The engine's own store is untouched.
+            Used by the Chunk 4.3-ii shadow hook to seed controlled state.
         """
         from headroom.cache.compression_cache import CompressionCache  # noqa: F401
         from headroom.proxy.helpers import (
@@ -403,11 +434,15 @@ class HeadroomEngine:
                     compressor.close()
 
         # --- Session / frozen-count derivation ---
-        # The engine owns its own session store (injected via AnthropicComponents);
-        # the parity test seeds it with a controlled _FixedTracker just as the
-        # golden recorder does.
-        session_id = ac.session_tracker_store.compute_session_id(ctx, model, messages)
-        prefix_tracker = ac.session_tracker_store.get_or_create(session_id, "anthropic")
+        # Use the store override when provided (Chunk 4.3-ii shadow hook);
+        # otherwise fall back to the engine's own private session store.
+        _effective_store = (
+            _session_tracker_store_override
+            if _session_tracker_store_override is not None
+            else ac.session_tracker_store
+        )
+        session_id = _effective_store.compute_session_id(ctx, model, messages)
+        prefix_tracker = _effective_store.get_or_create(session_id, "anthropic")
         frozen_message_count = prefix_tracker.get_frozen_message_count()
         if is_cache_mode(ac.config.mode):
             # Mirrors _strict_previous_turn_frozen_count at handler line ~890.

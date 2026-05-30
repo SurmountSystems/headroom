@@ -892,6 +892,22 @@ class AnthropicHandlerMixin:
                     frozen_message_count,
                 )
 
+            # Chunk 4.3-ii: snapshot prefix-tracker state BEFORE the legacy path
+            # mutates it. Captured only when the engine shadow is active.
+            # Snapshot happens here — right after frozen_message_count is
+            # resolved — so the engine sees the same prefix-tracker view as
+            # the live path for this request.
+            from headroom.proxy.helpers import get_engine_request_path as _get_erp
+
+            _engine_request_path = _get_erp(self.config.engine_request_path)
+            _shadow_snapshot: tuple[int, list, list] | None = None
+            if _engine_request_path == "shadow":
+                _shadow_snapshot = (
+                    frozen_message_count,
+                    prefix_tracker.get_last_original_messages(),
+                    prefix_tracker.get_last_forwarded_messages(),
+                )
+
             # PR-A6 (P5-50, preps P0-6): session-sticky `anthropic-beta` merge.
             # Read the client's beta value (note: anthropic-beta is NOT
             # an x-headroom-* header so it survived the A5 strip), union
@@ -1421,6 +1437,9 @@ class AnthropicHandlerMixin:
             # /v1/messages just as on /v1/responses.
             memory_context_injected = False
             memory_tools_injected = False
+            # Chunk 4.3-ii: capture the fetched memory context for the shadow
+            # call (reused, no extra await). None until memory injection fires.
+            _shadow_fetched_memory_context: str | None = None
             if memory_decision.inject:
                 # Search and inject memory context
                 if self.memory_handler.config.inject_context:
@@ -1444,6 +1463,8 @@ class AnthropicHandlerMixin:
                             f"{self.config.anthropic_pre_upstream_memory_context_timeout_seconds:.1f}s; "
                             "continuing without it"
                         )
+                    # Chunk 4.3-ii: capture for shadow reuse (no extra await).
+                    _shadow_fetched_memory_context = memory_context
                     try:
                         if memory_context:
                             from headroom.proxy.helpers import (
@@ -1658,6 +1679,168 @@ class AnthropicHandlerMixin:
                         body_mutation_tracker.mark_mutated("structural_diff_vs_original")
                 except (json.JSONDecodeError, ValueError):
                     body_mutation_tracker.mark_mutated("original_unparseable")
+
+            # ── Chunk 4.3-ii: engine shadow block ─────────────────────────────
+            # Runs ONLY when engine_request_path == "shadow". The engine output
+            # is ALWAYS discarded; the legacy path's bytes are forwarded in
+            # every mode. The entire block is exception-safe: any exception
+            # logs loudly, increments the error counter, and continues normally.
+            #
+            # The shadow is observe-only: it never raises into the live path.
+            if _engine_request_path == "shadow" and _shadow_snapshot is not None:
+                try:
+                    from headroom.engine.contract import (
+                        Flavor,
+                        Provider,
+                    )
+                    from headroom.engine.contract import (
+                        RequestContext as _EngineCtx,
+                    )
+                    from headroom.engine.session import derive_session_key as _derive_sk
+                    from headroom.proxy.helpers import prepare_outbound_body_bytes as _pobb
+
+                    # 1. Legacy bytes — what the handler is about to forward.
+                    _legacy_bytes, _legacy_source = _pobb(
+                        body=body,
+                        original_body_bytes=original_body_bytes,
+                        body_mutated=body_mutation_tracker.mutated,
+                    )
+
+                    # 2. Derive engine session key from the live request
+                    #    credentials + x-headroom-session header. Mirrors how
+                    #    the engine and CCR subsystem key sessions.
+                    _cred = request.headers.get("x-api-key") or request.headers.get(
+                        "authorization", ""
+                    )
+                    _conv_scope = request.headers.get("x-headroom-session", None)
+                    _engine_session_key = _derive_sk(
+                        credential=_cred,
+                        conversation_scope=_conv_scope,
+                        salt=b"headroom-proxy-engine",
+                    )
+
+                    # 3. Build a one-call controlled store seeded from the
+                    #    snapshot. This ensures the engine sees the same
+                    #    frozen_count + prior-turn messages as the live path.
+                    _snap_frozen_count, _snap_last_orig, _snap_last_fwd = _shadow_snapshot
+
+                    class _ShadowSeededStore:
+                        """One-call SessionTrackerStore for the shadow hook.
+
+                        Returns a pre-seeded tracker matching the live
+                        handler's snapshot for this request.  Writes stay
+                        in this transient object — engine private store
+                        is not modified.
+                        """
+
+                        class _Tracker:
+                            def __init__(self, frozen_count: int, last_orig: list, last_fwd: list):
+                                self._frozen_count = frozen_count
+                                self._last_orig = last_orig
+                                self._last_fwd = last_fwd
+
+                            def get_frozen_message_count(self) -> int:
+                                return self._frozen_count
+
+                            def get_last_original_messages(self) -> list:
+                                return list(self._last_orig)
+
+                            def get_last_forwarded_messages(self) -> list:
+                                return list(self._last_fwd)
+
+                            def update_from_response(self, **_kw: Any) -> None:
+                                pass  # shadow writes are discarded
+
+                        def __init__(self, frozen_count: int, last_orig: list, last_fwd: list):
+                            self._tracker = self._Tracker(frozen_count, last_orig, last_fwd)
+
+                        def compute_session_id(self, req: Any, mdl: str, msgs: Any) -> str:
+                            return "shadow-seeded"
+
+                        def get_or_create(self, sid: str, provider: str) -> Any:
+                            return self._tracker
+
+                    _seeded_store = _ShadowSeededStore(
+                        frozen_count=_snap_frozen_count,
+                        last_orig=list(_snap_last_orig),
+                        last_fwd=list(_snap_last_fwd),
+                    )
+
+                    # 4. Build the engine RequestContext. Use original_body_bytes
+                    #    so the engine sees the same pre-transform input as the
+                    #    live path received. prefetched_memory_context reuses the
+                    #    value the live path already fetched (no extra await).
+                    _engine_ctx = _EngineCtx(
+                        provider=Provider.ANTHROPIC,
+                        flavor=Flavor.MESSAGES,
+                        headers_view=dict(request.headers),
+                        raw_body=original_body_bytes if original_body_bytes is not None else b"{}",
+                        session_key=_engine_session_key,
+                        request_id=request_id,
+                        prefetched_memory_context=_shadow_fetched_memory_context,
+                    )
+
+                    # 5. Run the engine — output DISCARDED.
+                    _engine_decision = self.engine.on_request(
+                        _engine_ctx,
+                        _session_tracker_store_override=_seeded_store,
+                    )
+                    _engine_bytes = _engine_decision.body
+
+                    # 6. Diff and emit metrics / logs.
+                    self.metrics.engine_shadow_total += 1
+                    if _legacy_bytes == _engine_bytes:
+                        logger.debug(
+                            "event=engine_shadow_match request_id=%s "
+                            "legacy_bytes=%d engine_bytes=%d legacy_source=%s",
+                            request_id,
+                            len(_legacy_bytes),
+                            len(_engine_bytes),
+                            _legacy_source,
+                        )
+                    else:
+                        self.metrics.engine_shadow_divergence_total += 1
+                        # Bounded diff: first 200 bytes of each side.
+                        _diff_legacy = _legacy_bytes[:200]
+                        _diff_engine = _engine_bytes[:200]
+                        # Cheap JSON-key-level divergence category
+                        _div_category = "bytes_differ"
+                        try:
+                            _lj = json.loads(_legacy_bytes)
+                            _ej = json.loads(_engine_bytes)
+                            _legacy_keys = set(_lj.keys()) if isinstance(_lj, dict) else set()
+                            _engine_keys = set(_ej.keys()) if isinstance(_ej, dict) else set()
+                            if _legacy_keys != _engine_keys:
+                                _div_category = "top_level_keys_differ"
+                            elif _lj.get("messages") != _ej.get("messages"):
+                                _div_category = "messages_differ"
+                            elif _lj.get("system") != _ej.get("system"):
+                                _div_category = "system_differs"
+                            elif _lj.get("tools") != _ej.get("tools"):
+                                _div_category = "tools_differ"
+                        except (json.JSONDecodeError, ValueError, AttributeError):
+                            _div_category = "non_json_diff"
+                        logger.warning(
+                            "event=engine_shadow_divergence request_id=%s "
+                            "legacy_bytes=%d engine_bytes=%d "
+                            "category=%s "
+                            "legacy_prefix=%s engine_prefix=%s",
+                            request_id,
+                            len(_legacy_bytes),
+                            len(_engine_bytes),
+                            _div_category,
+                            _diff_legacy,
+                            _diff_engine,
+                        )
+                except Exception as _shadow_exc:
+                    self.metrics.engine_shadow_error_total += 1
+                    logger.warning(
+                        "event=engine_shadow_error request_id=%s error=%r; "
+                        "shadow exception — legacy path continues normally",
+                        request_id,
+                        _shadow_exc,
+                    )
+            # ── end of shadow block ───────────────────────────────────────────
 
             # Forward request - use Bedrock backend if configured, otherwise direct API
             if self.anthropic_backend is not None:

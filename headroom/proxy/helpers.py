@@ -294,6 +294,41 @@ def get_python_forwarder_mode() -> PythonForwarderMode:
     )
 
 
+_ENGINE_REQUEST_PATH_ENV = "HEADROOM_ENGINE_REQUEST_PATH"
+_ENGINE_REQUEST_PATH_VALID = frozenset({"off", "shadow"})
+_ENGINE_REQUEST_PATH_DEFAULT = "off"
+
+
+def get_engine_request_path(config_value: str | None = None) -> str:
+    """Return the active engine-request-path mode.
+
+    Priority: explicit ``config_value`` (from ``ProxyConfig.engine_request_path``)
+    → ``HEADROOM_ENGINE_REQUEST_PATH`` env var → ``"off"`` default.
+
+    Valid values: ``"off"`` (default, zero overhead), ``"shadow"`` (observe-only).
+    ``"on"`` is reserved for Chunk 4.4 and rejected here to prevent
+    accidental enablement before the flip is ready.
+
+    Raises ``ValueError`` on unknown values — per the no-silent-fallback
+    build constraint.
+    """
+    # Config field takes precedence (set explicitly by operator/test)
+    raw = config_value if config_value is not None else ""
+    if not raw:
+        raw = os.environ.get(_ENGINE_REQUEST_PATH_ENV, "").strip().lower()
+    else:
+        raw = raw.strip().lower()
+    if not raw:
+        return _ENGINE_REQUEST_PATH_DEFAULT
+    if raw in _ENGINE_REQUEST_PATH_VALID:
+        return raw
+    raise ValueError(
+        f"Invalid engine_request_path={raw!r} (env: {_ENGINE_REQUEST_PATH_ENV}); "
+        f"expected one of {sorted(_ENGINE_REQUEST_PATH_VALID)!r}. "
+        f"'on' is reserved for Chunk 4.4 and not yet wired."
+    )
+
+
 def extract_tags(headers: Any) -> dict[str, str]:
     """Extract ``x-headroom-*`` tags from inbound headers.
 

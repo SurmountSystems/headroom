@@ -311,6 +311,15 @@ class ProxyConfig:
     # ``HeadroomProxy._run_compression_in_executor``.
     compression_max_workers: int | None = None
 
+    # Chunk 4.3-ii: HeadroomEngine shadow hook mode.
+    # "off" (default) → engine is never called on the request path; zero overhead.
+    # "shadow" → engine runs in parallel, output DISCARDED; divergence is
+    #            observed via metrics/logs only. The response a client receives
+    #            is byte-identical to today in both modes.
+    # "on" → engine drives the request path (Chunk 4.4, deferred).
+    # Env: HEADROOM_ENGINE_REQUEST_PATH.
+    engine_request_path: str = "off"
+
     @property
     def provider_api_overrides(self) -> ProviderApiOverrides:
         """Return provider API URL overrides as a dedicated provider config object."""
