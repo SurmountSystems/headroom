@@ -103,6 +103,7 @@ pytest_cache/
 .env
 .env.*
 !.env.act.example
+!.env.example
 .venv
 env/
 venv/

@@ -344,3 +344,47 @@ class TestDecodeProjectPath:
         assert len(projects) == 1
         assert projects[0].name == "work"
         assert str(projects[0].project_path).startswith("C:")
+
+    def test_home_dir_username_stays_single_component(self) -> None:
+        """A home-directory name must survive decoding as one component.
+
+        Claude Code flattens ``/``, ``.``, ``-`` and ``_`` all to ``-`` when
+        escaping, so a project under ``/Users/first.last`` (or
+        ``/home/first.last``) is stored as ``-Users-first-last-…``. The decoder
+        used to consume only the first token after ``Users``/``home`` as the
+        home directory and walk from ``/Users/first`` (which does not exist), so
+        it bailed out and callers fell back to the literal
+        ``/Users/first/last`` — causing ``headroom learn --apply`` to fail with
+        ``PermissionError: '/Users/first'`` for usernames such as
+        ``first.last``. This is the Unix counterpart of
+        ``test_windows_username_with_dot_stays_single_component``.
+
+        Rooted at the real home so it exercises the ``Users``/``home`` branch on
+        both macOS (``/Users/…``) and Linux (``/home/…``); skipped when the home
+        directory is neither rooted there nor writable.
+        """
+        import shutil
+
+        home = Path.home()
+        if len(home.parts) < 3 or home.parts[1] not in ("Users", "home"):
+            pytest.skip("decoder branch only activates under /Users or /home")
+
+        base = home / f"pytest_headroom_{uuid4().hex}"
+        try:
+            base.mkdir()
+        except (PermissionError, OSError):
+            pytest.skip("home directory is not writable")
+
+        try:
+            project = base / "my.project"
+            project.mkdir()
+
+            # Flatten separators exactly as Claude Code does when escaping.
+            encoded = "-" + str(project)[1:].replace("/", "-").replace(".", "-").replace("_", "-")
+            result = _decode_project_path(encoded)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+
+        assert result == project
+        # The home component is reconstructed whole, never split on a separator.
+        assert home.name in result.parts
