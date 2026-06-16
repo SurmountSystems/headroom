@@ -167,7 +167,6 @@ from headroom.transforms import (
     CacheAligner,
     CodeAwareCompressor,
     CodeCompressorConfig,
-    CompressionStrategy,
     ContentRouter,
     ContentRouterConfig,
     TransformPipeline,
@@ -526,6 +525,7 @@ def _check_rust_core() -> tuple[str, str | None]:
 from headroom.proxy.handlers import (  # noqa: E402
     AnthropicHandlerMixin,
     BatchHandlerMixin,
+    BedrockHandlerMixin,
     GeminiHandlerMixin,
     OpenAIHandlerMixin,
     StreamingMixin,
@@ -538,6 +538,7 @@ class HeadroomProxy(
     OpenAIHandlerMixin,
     GeminiHandlerMixin,
     BatchHandlerMixin,
+    BedrockHandlerMixin,
 ):
     """Production-ready Headroom optimization proxy."""
 
@@ -618,7 +619,6 @@ class HeadroomProxy(
         )
         if config.disable_kompress:
             router_config.enable_kompress = False
-            router_config.fallback_strategy = CompressionStrategy.PASSTHROUGH
         # A non-None exclude_tools replaces DEFAULT_EXCLUDE_TOOLS in
         # ContentRouter, so merge rather than assign.
         if config.exclude_tools:
@@ -796,6 +796,7 @@ class HeadroomProxy(
             anyllm_provider=config.anyllm_provider,
             bedrock_region=config.bedrock_region,
             logger=logger,
+            openai_api_url=config.openai_api_url,
             anyllm_backend_cls=AnyLLMBackend,
             litellm_backend_cls=LiteLLMBackend,
         )
@@ -3489,6 +3490,7 @@ def _proxy_config_from_env() -> ProxyConfig:
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
+        bedrock_api_url=os.environ.get("BEDROCK_TARGET_API_URL"),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", "openai"),
         disable_kompress=_get_env_bool("HEADROOM_DISABLE_KOMPRESS", False),
         max_connections=_get_env_int("HEADROOM_MAX_CONNECTIONS", 500),
@@ -3797,6 +3799,14 @@ if __name__ == "__main__":
         help="AWS profile for Bedrock backend (default: use default credentials)",
     )
     parser.add_argument(
+        "--bedrock-api-url",
+        help=(
+            "Custom Bedrock InvokeModel upstream for the /model/{id}/invoke "
+            "passthrough routes — point at a re-signing gateway, not raw AWS "
+            "(env: BEDROCK_TARGET_API_URL)"
+        ),
+    )
+    parser.add_argument(
         "--openrouter-api-key",
         help="OpenRouter API key (or set OPENROUTER_API_KEY env var)",
     )
@@ -3942,6 +3952,7 @@ if __name__ == "__main__":
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),
         bedrock_profile=args.bedrock_profile or os.environ.get("AWS_PROFILE"),
+        bedrock_api_url=_get_env_str("BEDROCK_TARGET_API_URL", args.bedrock_api_url),
         anyllm_provider=_get_env_str("HEADROOM_ANYLLM_PROVIDER", args.anyllm_provider),
         optimize=optimize,
         min_tokens_to_crush=_get_env_int("HEADROOM_MIN_TOKENS", args.min_tokens),
