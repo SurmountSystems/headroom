@@ -1102,11 +1102,12 @@ def _token_kind(token: str) -> str:
 
 def _maybe_capture_outbound(url: str, headers: dict[str, str]) -> None:
     """Debug hook: when ``HEADROOM_COPILOT_DEBUG_OUTBOUND`` is set, append a
-    secret-free record of the exact request Headroom is about to forward to the
-    Copilot API. Lets us tell a Headroom bug (wrong host / integration-id / token
-    kind) apart from an upstream entitlement 400 without exposing any token.
+    secret-free record of the request Headroom is about to forward to the Copilot
+    API. Lets us tell a Headroom bug (wrong host / integration-id / token kind)
+    apart from an upstream entitlement 400.
 
-    Uncommitted diagnostic — remove with ``git checkout -- headroom/copilot_auth.py``.
+    No token bytes are ever written or logged: the auth header is reduced to fixed
+    labels (scheme + type prefix) via prefix tests, never a slice of the token.
     """
 
     if os.environ.get("HEADROOM_COPILOT_DEBUG_OUTBOUND", "").strip().lower() not in (
@@ -1118,7 +1119,18 @@ def _maybe_capture_outbound(url: str, headers: dict[str, str]) -> None:
         return
     try:
         auth = next((v for k, v in headers.items() if k.lower() == "authorization"), "")
-        scheme, _, raw = auth.partition(" ")
+        # Constant labels only — `scheme_label`/`token_label` are literals chosen by
+        # prefix tests, so no token-derived string reaches the file or the log sink.
+        if not auth:
+            scheme_label, token_label = "(none)", "none"
+        else:
+            scheme_label = "Bearer" if auth[:7].lower() == "bearer " else "(other)"
+            rest = auth.partition(" ")[2]
+            token_label = "present"
+            for known in ("tid_", "gho_", "ghs_", "ghp_", "github_pat_"):
+                if rest.startswith(known):
+                    token_label = known + "***"
+                    break
         identity = {
             k: v
             for k, v in headers.items()
@@ -1128,9 +1140,8 @@ def _maybe_capture_outbound(url: str, headers: dict[str, str]) -> None:
         record = {
             "host": urlparse(url).netloc,
             "url": url,
-            "auth_scheme": scheme or "(none)",
-            "token_prefix": (raw[:6] + "…") if raw else "",
-            "token_kind": _token_kind(raw) if raw else "none",
+            "auth_scheme": scheme_label,
+            "token_kind": token_label,
             "identity_headers": identity,
         }
         default_path = Path.home() / ".headroom" / "copilot_outbound.jsonl"
@@ -1143,8 +1154,8 @@ def _maybe_capture_outbound(url: str, headers: dict[str, str]) -> None:
             record["host"],
             identity.get("Copilot-Integration-Id") or identity.get("copilot-integration-id") or "-",
             identity.get("Editor-Version") or identity.get("editor-version") or "-",
-            record["auth_scheme"],
-            record["token_kind"],
+            scheme_label,
+            token_label,
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("copilot outbound capture failed: %s", exc)

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -34,10 +35,18 @@ except Exception as e:  # noqa: BLE001
 PREMIUM = ("gpt-5", "claude", "gemini", "o1", "o3")
 REASONING = ("gpt-5", "o1", "o3")  # these need /responses, not /chat/completions (#644/#647)
 PROBE = ["gpt-4o", "gpt-5.5", "claude-sonnet-4.6"]
+# GitHub token TYPE prefixes — these are not secret (the random bytes after are).
+TOKEN_PREFIXES = ("github_pat_", "gho_", "ghu_", "ghs_", "ghp_", "tid_")
 
 
 def redact(t: str | None) -> str:
-    return f"{t[:6]}…(len {len(t)})" if t else "—"
+    """Show only the non-secret type prefix + length — never any token bytes."""
+    if not t:
+        return "—"
+    for p in TOKEN_PREFIXES:
+        if t.startswith(p):
+            return f"{p}…(len {len(t)})"
+    return f"…(len {len(t)})"
 
 
 def head(n: str) -> None:
@@ -107,9 +116,10 @@ try:
         f"    api token : {redact(api_token)}  kind={'tid_(exchanged)' if api_token.startswith('tid_') else 'gho_(used DIRECTLY — no exchange)'}"
     )
     print(f"    api host  : {api_url}")
-    if "enterprise" in api_url or "ghe.com" in api_url:
+    _host = (urlparse(api_url).hostname or "").lower()
+    if _host == "ghe.com" or _host.endswith(".ghe.com") or "enterprise" in _host:
         print("    host type : ENTERPRISE / data-residency")
-    elif "individual" in api_url:
+    elif "individual" in _host:
         print("    host type : individual segmented host")
     else:
         print(
